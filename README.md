@@ -8,7 +8,7 @@
 
 ## Why this exists
 
-Half my client calls happen on WhatsApp, and every single time I told myself "I'll write it down after." I did not write it down after. CallScribe sits in the menu bar, notices the call, asks one question, and an hour later I have a note with decisions, to-dos for both sides and the full transcript. Nobody has to join a bot to the call, and the audio never leaves my Mac.
+A lot of my calls happen on WhatsApp, and every time I told myself "I'll write it down after." I did not write it down after. CallScribe sits in the menu bar, notices the call, asks one question, and an hour later I have a note with decisions, to-dos for both sides and the full transcript. Nobody has to join a bot to the call, and the audio never leaves my Mac.
 
 ## What it does
 
