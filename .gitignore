@@ -1,0 +1,9 @@
+.env
+build/
+*.app
+*.caf
+*.wav
+*.aiff
+recordings/
+screens/
+.DS_Store
