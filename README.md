@@ -14,7 +14,7 @@ A lot of my calls happen on WhatsApp, and every time I told myself "I'll write i
 
 - Notices when a WhatsApp call starts (it watches which app uses the microphone, no WhatsApp hacks).
 - Pops a small panel: who is it, which project, **Record** or **Not this call**. It never records without that click.
-- Records both sides on separate tracks: your mic, and WhatsApp's audio through a macOS process tap.
+- Records both sides on separate tracks: your mic, and WhatsApp's audio through a macOS process tap. Works with any speakers, headphones or audio interface; if a track stops (device switch, sleeping monitor) it repairs itself during the call, and the note lists any gap. Menu › **Other side audio** pins a device if you ever need to.
 - Transcribes on your Mac with whisper.cpp, any language, and labels who said what.
 - Writes a Markdown note: summary, decisions, to-dos for you, to-dos for them, open questions, transcript. Works great with Obsidian or any notes folder.
 - Remembers which contact belongs to which project, and reads the caller's name from the WhatsApp call window.
