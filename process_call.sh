@@ -130,6 +130,9 @@ fi
   echo "- Project: $PROJECT"
   echo "- Audio: ${SESSION/#$HOME/~}"
   if (( ${#ERRORS} )); then echo; for e in "${ERRORS[@]}"; do echo "> ERROR: $e (see $SESSION/process.log; re-run: process_call.sh)"; done; fi
+  # recording problems from the app (other side not recorded, gaps): shown so a half transcript is never mistaken for the call
+  PROBS=$(jq -r '.problems // [] | .[]' "$SESSION/meta.json" 2>/dev/null)
+  if [[ -n "$PROBS" ]]; then echo; echo "> **Recording problems:**"; while IFS= read -r p; do echo "> - $p"; done <<<"$PROBS"; fi
   echo
   if [[ -s "$SUMMARY" ]]; then cat "$SUMMARY"; echo; fi
   echo "## Transcript"

@@ -66,10 +66,66 @@ func processObject(forPID pid: Int32) -> AudioObjectID? {
     let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, UInt32(MemoryLayout<pid_t>.size), &p, &sz, &out)
     return st == noErr && out != 0 ? out : nil
 }
-func defaultOutputUID() -> String? {
-    var a = addr(kAudioHardwarePropertyDefaultSystemOutputDevice); var dev = AudioObjectID(0); var sz = UInt32(4)
+// MARK: - Which output the other side plays on
+// The tap records WhatsApp's audio, but the aggregate device it runs in needs a clock device. Until 1.2.0 that was the
+// "system output" (alert sounds) device; on 2026-11-23 it was not the device in use and the other side got 0 frames.
+// Now: the device chosen in the menu, else the device WhatsApp plays to, else the default output.
+
+struct OutDevice { let id: AudioObjectID; let uid: String; let name: String }
+
+func outputDevices() -> [OutDevice] {
+    var a = addr(kAudioHardwarePropertyDevices); var sz: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz) == noErr, sz > 0 else { return [] }
+    var ids = [AudioObjectID](repeating: 0, count: Int(sz) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &ids) == noErr else { return [] }
+    return ids.compactMap { d in
+        var sa = addr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput); var ssz: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(d, &sa, 0, nil, &ssz) == noErr, ssz > 0,
+              let uid = getString(d, kAudioDevicePropertyDeviceUID), let name = getString(d, kAudioObjectPropertyName),
+              !name.hasPrefix("CallScribe") else { return nil }
+        return OutDevice(id: d, uid: uid, name: name)
+    }
+}
+
+func defaultOutput() -> OutDevice? {
+    var a = addr(kAudioHardwarePropertyDefaultOutputDevice); var dev = AudioObjectID(0); var sz = UInt32(MemoryLayout<AudioObjectID>.size)
     guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &dev) == noErr else { return nil }
-    return getString(dev, kAudioDevicePropertyDeviceUID)
+    return outputDevices().first { $0.id == dev }
+}
+
+/// Output devices the given processes are playing to right now.
+func devicesUsed(by objs: [AudioObjectID]) -> [AudioObjectID] {
+    var out: [AudioObjectID] = []
+    for o in objs {
+        var a = addr(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput); var sz: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(o, &a, 0, nil, &sz) == noErr, sz > 0 else { continue }
+        var ids = [AudioObjectID](repeating: 0, count: Int(sz) / MemoryLayout<AudioObjectID>.size)
+        if AudioObjectGetPropertyData(o, &a, 0, nil, &sz, &ids) == noErr { out += ids }
+    }
+    return out
+}
+
+/// Menu choice "Other side audio": nil = Automatic.
+var preferredOutputUID: String? {
+    get { defaults.string(forKey: "outputDeviceUID") }
+    set { defaults.set(newValue, forKey: "outputDeviceUID") }
+}
+
+/// Clock devices to try for the tap, in order. nil = no clock device: the aggregate runs on the tap itself, which
+/// depends on no speaker, monitor or headset (measured 2026-11-23: the only setups that delivered frames were this
+/// and the MacBook speakers; US-4x4, BlackHole and the ASUS monitor gave 0 frames even while audio played).
+func clockCandidates(for objs: [AudioObjectID]) -> [(device: OutDevice?, why: String)] {
+    let all = outputDevices()
+    var out: [(OutDevice?, String)] = []
+    func add(_ d: OutDevice?, _ why: String) { if !out.contains(where: { $0.0?.uid == d?.uid }) { out.append((d, why)) } }
+    if let uid = preferredOutputUID, let d = all.first(where: { $0.uid == uid }) { add(d, "chosen in the menu") }
+    add(nil, "WhatsApp's own audio, no output device needed")
+    if let d = all.first(where: { $0.uid == "BuiltInSpeakerDevice" }) { add(d, "built-in speakers as clock") }
+    let used = devicesUsed(by: objs)
+    for d in all where used.contains(d.id) { add(d, "WhatsApp plays here") }
+    if let d = defaultOutput() { add(d, "default output") }
+    for d in all { add(d, "fallback") }
+    return out
 }
 
 // MARK: - Caller name (Accessibility: WhatsApp window titles)
@@ -123,27 +179,104 @@ func contactFolder(_ s: String) -> String {
 
 // MARK: - Recorder (mic + process tap)
 
+/// One audio track on disk. The file keeps the format of the first source; a later source (after a device switch or a
+/// rebuilt tap) is converted. The timeline follows the wall clock: a gap is padded with silence, so me and them stay aligned.
+final class TrackWriter {
+    let fmt: AVAudioFormat
+    private let file: AVAudioFile, start: Date
+    private var converter: AVAudioConverter?, convFrom: AVAudioFormat?
+    private(set) var frames: Int64 = 0
+    private(set) var lastWrite: Date?
+    private(set) var lastSound: Date?
+    private(set) var padded: Double = 0
+
+    init(url: URL, format: AVAudioFormat, start: Date) throws {
+        file = try AVAudioFile(forWriting: url, settings: format.settings, commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+        fmt = format; self.start = start
+    }
+
+    private func silence(_ n: Int64) -> AVAudioPCMBuffer? {
+        guard n > 0, let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)) else { return nil }
+        b.frameLength = AVAudioFrameCount(n)
+        for buf in UnsafeMutableAudioBufferListPointer(b.mutableAudioBufferList) { if let d = buf.mData { memset(d, 0, Int(buf.mDataByteSize)) } }
+        return b
+    }
+
+    func write(_ input: AVAudioPCMBuffer) {
+        var b = input
+        if !input.format.isEqual(fmt) {
+            if convFrom == nil || !convFrom!.isEqual(input.format) { converter = AVAudioConverter(from: input.format, to: fmt); convFrom = input.format }
+            let cap = AVAudioFrameCount(Double(input.frameLength) * fmt.sampleRate / max(input.format.sampleRate, 1)) + 256
+            guard let c = converter, let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return }
+            var fed = false; var err: NSError?
+            c.convert(to: out, error: &err) { _, st in
+                if fed { st.pointee = .noDataNow; return nil }
+                fed = true; st.pointee = .haveData; return input
+            }
+            guard err == nil, out.frameLength > 0 else { return }
+            b = out
+        }
+        var gap = Int64(Date().timeIntervalSince(start) * fmt.sampleRate) - Int64(b.frameLength) - frames
+        if gap > Int64(fmt.sampleRate / 2) {
+            padded += Double(gap) / fmt.sampleRate
+            let chunk = Int64(fmt.sampleRate)   // pad in 1 s pieces, a 15 min gap must not allocate 400 MB at once
+            while gap > 0, let s = silence(min(gap, chunk)) { if (try? file.write(from: s)) == nil { break }; frames += Int64(s.frameLength); gap -= Int64(s.frameLength) }
+        }
+        if (try? file.write(from: b)) != nil { frames += Int64(b.frameLength); lastWrite = Date() }
+        if let ch = b.floatChannelData {
+            let n = Int(b.frameLength) * (b.format.isInterleaved ? Int(b.format.channelCount) : 1)
+            var peak: Float = 0
+            for i in stride(from: 0, to: n, by: 4) { peak = max(peak, abs(ch[0][i])) }
+            if peak > 0.0001 { lastSound = Date() }   // -80 dB: true digital silence is 0, quiet speech is far above
+        }
+    }
+}
+
 final class Recorder {
-    private let engine = AVAudioEngine()
-    private var micFile: AVAudioFile?
-    private var themFile: AVAudioFile?
+    private var engine = AVAudioEngine()
+    private var mic: TrackWriter?, them: TrackWriter?
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    private var tapFormat: AVAudioFormat?
     private let ioQueue = DispatchQueue(label: "callscribe.io", qos: .userInitiated)
+    private var dir = URL(fileURLWithPath: "/tmp"), start = Date(), objs: [AudioObjectID] = []
+    private var lastMicRestart = Date.distantPast, lastTapRestart = Date.distantPast
+    private var candidate = 0                    // index into clockCandidates(); moves on when a clock delivers nothing
+    private var tapStarted = Date()
+    private var cfgObserver: NSObjectProtocol?
     private(set) var running = false
-    var themFrames: Int64 = 0
+    private(set) var device = ""                 // output device the other side is recorded from
+    private(set) var events: [String] = []       // restarts and device choices, logged and written to meta.json
+    /// Finds the target processes again when the tap is rebuilt (a video call can move audio to another process).
+    var rescan: (() -> [AudioObjectID])?
+    var themFrames: Int64 { them?.frames ?? 0 }
+    var micFrames: Int64 { mic?.frames ?? 0 }
+    /// True while one of the two tracks is not delivering audio. Drives the warning icon.
+    private(set) var degraded = false
+
+    private func note(_ s: String) {
+        let t = Int(Date().timeIntervalSince(start))
+        events.append(String(format: "%02d:%02d %@", t / 60, t % 60, s)); log("recorder: \(s)")
+    }
 
     /// Starts both tracks. Returns a list of problems (empty = fully ok).
     func start(dir: URL, processObjects: [AudioObjectID]) -> [String] {
+        self.dir = dir; start = Date(); objs = processObjects; events = []; candidate = 0
         var problems: [String] = []
-        if let p = startMic(dir.appendingPathComponent("me.caf")) { problems.append(p) }
-        if let p = startTap(dir.appendingPathComponent("them.caf"), processObjects) { problems.append(p) }
+        if let p = startMic() { problems.append(p) }
+        if let p = startTap() { problems.append(p) }
         running = true
+        // macOS stops AVAudioEngine when the audio setup changes (headphones, video call). Until 1.2.0 the mic then
+        // stayed dead for the rest of the call (2026-11-23: 3:45 of 17:51 recorded).
+        cfgObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] n in
+            guard let self, self.running, (n.object as? AVAudioEngine) === self.engine else { return }
+            self.note("audio setup changed, restarting the mic"); self.restartMic(force: true)
+        }
         return problems
     }
 
-    private func startMic(_ url: URL) -> String? {
+    private func startMic() -> String? {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: break
         case .notDetermined:
@@ -157,14 +290,23 @@ final class Recorder {
         let fmt = input.outputFormat(forBus: 0)
         guard fmt.channelCount > 0, fmt.sampleRate > 0 else { return "No microphone input format" }
         do {
-            micFile = try AVAudioFile(forWriting: url, settings: fmt.settings, commonFormat: fmt.commonFormat, interleaved: fmt.isInterleaved)
-            input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buf, _ in try? self?.micFile?.write(from: buf) }
+            if mic == nil { mic = try TrackWriter(url: dir.appendingPathComponent("me.caf"), format: fmt, start: start) }
+            let w = mic
+            input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { buf, _ in w?.write(buf) }
             try engine.start()
             return nil
         } catch { return "Mic start failed: \(error.localizedDescription)" }
     }
 
-    private func startTap(_ url: URL, _ objs: [AudioObjectID]) -> String? {
+    func restartMic(force: Bool) {
+        guard running, force || Date().timeIntervalSince(lastMicRestart) > 6 else { return }
+        lastMicRestart = Date()
+        engine.inputNode.removeTap(onBus: 0); engine.stop()
+        engine = AVAudioEngine()
+        if let p = startMic() { note("mic restart failed: \(p)") } else { note("mic restarted") }
+    }
+
+    private func startTap() -> String? {
         guard !objs.isEmpty else { return "No target audio process found for the tap" }
         let desc = CATapDescription(stereoMixdownOfProcesses: objs)
         desc.uuid = UUID(); desc.name = "CallScribe tap"; desc.isPrivate = true; desc.muteBehavior = .unmuted
@@ -183,10 +325,15 @@ final class Recorder {
             kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceTapListKey: [sub],
         ]
-        if let uid = defaultOutputUID() {
-            dict[kAudioAggregateDeviceMainSubDeviceKey] = uid
-            dict[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: uid]]
-        }
+        let cands = clockCandidates(for: objs)
+        let (d, why) = cands[candidate % cands.count]
+        if let d {
+            dict[kAudioAggregateDeviceMainSubDeviceKey] = d.uid
+            dict[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: d.uid]]
+            device = d.name
+        } else { device = "WhatsApp audio (no output device)" }
+        note("other side: \(device) (\(why))")
+        tapStarted = Date()
         st = AudioHardwareCreateAggregateDevice(dict as CFDictionary, &aggID)
         guard st == noErr else { return "Aggregate device failed (\(st))" }
         // The IOProc delivers frames at the aggregate's rate (the output device, e.g. 44.1 kHz speakers), not the
@@ -197,29 +344,74 @@ final class Recorder {
             asbd.mSampleRate = rate
         }
         guard let fmt = AVAudioFormat(streamDescription: &asbd) else { return "Tap format unusable" }
-        do { themFile = try AVAudioFile(forWriting: url, settings: fmt.settings, commonFormat: fmt.commonFormat, interleaved: fmt.isInterleaved) }
-        catch { return "them.caf open failed: \(error.localizedDescription)" }
-        st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, ioQueue) { [weak self] _, inData, _, _, _ in
-            guard let self, let f = self.themFile,
-                  let buf = AVAudioPCMBuffer(pcmFormat: fmt, bufferListNoCopy: inData, deallocator: nil) else { return }
-            try? f.write(from: buf); self.themFrames += Int64(buf.frameLength)
+        tapFormat = fmt
+        if them == nil {
+            do { them = try TrackWriter(url: dir.appendingPathComponent("them.caf"), format: fmt, start: start) }
+            catch { return "them.caf open failed: \(error.localizedDescription)" }
         }
-        guard st == noErr, let procID else { return "IOProc failed (\(st))" }
+        let w = them
+        st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, ioQueue) { _, inData, _, _, _ in
+            guard let w, let buf = AVAudioPCMBuffer(pcmFormat: fmt, bufferListNoCopy: inData, deallocator: nil) else { return }
+            w.write(buf)
+        }
+        guard st == noErr else { return "IOProc failed (\(st))" }
         st = AudioDeviceStart(aggID, procID)
         return st == noErr ? nil : "AudioDeviceStart failed (\(st))"
     }
 
-    func stop() {
-        guard running else { return }
-        running = false
-        engine.inputNode.removeTap(onBus: 0); engine.stop()
+    private func stopTap() {
         if aggID != kAudioObjectUnknown {
             if let procID { AudioDeviceStop(aggID, procID); AudioDeviceDestroyIOProcID(aggID, procID) }
             AudioHardwareDestroyAggregateDevice(aggID)
         }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
+        procID = nil; aggID = AudioObjectID(kAudioObjectUnknown); tapID = AudioObjectID(kAudioObjectUnknown)
         ioQueue.sync {}
-        micFile = nil; themFile = nil   // closes files
+    }
+
+    /// Rebuilds the tap with a fresh process list. next = try the next clock device (the current one delivered nothing);
+    /// a menu change restarts from the top of the list.
+    func restartTap(force: Bool, next: Bool = false) {
+        guard running, force || Date().timeIntervalSince(lastTapRestart) > 4 else { return }
+        lastTapRestart = Date()
+        candidate = next ? candidate + 1 : 0
+        stopTap()
+        if let r = rescan?(), !r.isEmpty { objs = r }
+        if let p = startTap() { note("tap rebuild failed: \(p)") } else { note("tap rebuilt") }
+    }
+
+    /// Called once per second while recording. otherSideActive = the target app is playing audio right now.
+    func health(otherSideActive: Bool) {
+        guard running else { return }
+        let now = Date(), age = now.timeIntervalSince(start)
+        let micStalled = age > 4 && now.timeIntervalSince(mic?.lastWrite ?? start) > 4
+        let tapStalled = otherSideActive && now.timeIntervalSince(max(them?.lastWrite ?? start, tapStarted)) > 3
+        if micStalled, now.timeIntervalSince(lastMicRestart) > 6 { note("mic delivered nothing for 4 s"); restartMic(force: false) }
+        if tapStalled, now.timeIntervalSince(lastTapRestart) > 4 { note("other side delivered nothing for 3 s on '\(device)', trying the next clock"); restartTap(force: false, next: true) }
+        degraded = micStalled || tapStalled
+    }
+
+    /// Stops both tracks and returns what went wrong, in plain words, for meta.json and the note.
+    @discardableResult
+    func stop() -> [String] {
+        guard running else { return [] }
+        running = false
+        if let o = cfgObserver { NotificationCenter.default.removeObserver(o); cfgObserver = nil }
+        engine.inputNode.removeTap(onBus: 0); engine.stop()
+        stopTap()
+        let secs = Date().timeIntervalSince(start)
+        var issues: [String] = []
+        if let t = them {
+            if t.frames == 0 { issues.append("Other side NOT recorded: no audio arrived from WhatsApp (output '\(device)')") }
+            else if t.lastSound == nil { issues.append("Other side silent the whole call (output '\(device)'): wrong output chosen, or they were muted") }
+            if t.padded > 2 { issues.append(String(format: "Other side had gaps, %.0f s of %.0f s filled with silence", t.padded, secs)) }
+        } else { issues.append("Other side NOT recorded: tap never started") }
+        if let m = mic {
+            if m.frames == 0 { issues.append("Your mic NOT recorded") }
+            else if m.padded > 2 { issues.append(String(format: "Your mic had gaps, %.0f s of %.0f s filled with silence", m.padded, secs)) }
+        } else { issues.append("Your mic NOT recorded: mic never started") }
+        mic = nil; them = nil   // closes files
+        return issues
     }
 }
 
@@ -338,7 +530,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var inactiveSince: Date?
     var prompt: PromptController?
     let recorder = Recorder()
-    var sessionDir: URL?, sessionWith = "", sessionProject = "", sessionStart = Date()
+    var sessionDir: URL?, sessionWith = "", sessionProject = "", sessionStart = Date(), sessionProblems: [String] = []
+    let outputMenu = NSMenu()
     var statusLine = NSMenuItem(), stopItem = NSMenuItem(), lastItem = NSMenuItem(), loginItem = NSMenuItem()
     var timer: Timer?
     var promptShown = Date()
@@ -357,7 +550,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         updateItem = NSMenuItem(title: "Update…", action: #selector(installUpdate), keyEquivalent: ""); updateItem.isHidden = true
         let checkItem = NSMenuItem(title: "Check for updates… (v\(appVersion))", action: #selector(checkFromMenu), keyEquivalent: "")
         let menu = NSMenu()
-        for i in [statusLine, .separator(), stopItem, lastItem, .separator(), loginItem, updateItem, checkItem, .separator()] { menu.addItem(i) }
+        let outputItem = NSMenuItem(title: "Other side audio", action: nil, keyEquivalent: "")
+        outputItem.submenu = outputMenu; outputMenu.delegate = self
+        for i in [statusLine, .separator(), stopItem, lastItem, outputItem, .separator(), loginItem, updateItem, checkItem, .separator()] { menu.addItem(i) }
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         for i in menu.items where i.action != nil { i.target = self }
         menu.delegate = self
@@ -380,11 +575,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let b = item.button else { return }
         let rec = state == .recording
         let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-        let img = NSImage(systemSymbolName: rec ? "record.circle.fill" : "phone.badge.waveform", accessibilityDescription: "CallScribe")?
-            .withSymbolConfiguration(rec ? cfg.applying(.init(paletteColors: [.systemRed])) : cfg)
+        let warn = rec && recorder.degraded
+        let img = NSImage(systemSymbolName: warn ? "exclamationmark.circle.fill" : rec ? "record.circle.fill" : "phone.badge.waveform", accessibilityDescription: "CallScribe")?
+            .withSymbolConfiguration(rec ? cfg.applying(.init(paletteColors: [warn ? .systemOrange : .systemRed])) : cfg)
         img?.isTemplate = !rec
         b.image = img
-        statusLine.title = rec ? "Recording \(sessionWith)" : state == .prompting ? "Call detected, waiting for your answer"
+        statusLine.title = rec ? (warn ? "Recording \(sessionWith): a track is not coming through, repairing" : "Recording \(sessionWith) · other side: \(recorder.device)") : state == .prompting ? "Call detected, waiting for your answer"
             : pipelinesRunning > 0 ? "Writing call note…" : "Idle"
         stopItem.isEnabled = rec
     }
@@ -414,7 +610,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case .declined:
             if ended { state = .idle }
         case .recording:
-            if ended { log("call ended, stopping"); stopRecording() }
+            if ended { log("call ended, stopping"); stopRecording(); break }
+            let was = recorder.degraded
+            recorder.health(otherSideActive: out)
+            if was != recorder.degraded { updateIcon() }
         }
     }
 
@@ -442,13 +641,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         sessionDir = dir; sessionWith = who; sessionProject = project; sessionStart = Date()
         let objs = audioProcesses().filter { $0.bundleID.hasPrefix(targetPrefix) }.map { $0.obj }
+        recorder.rescan = { audioProcesses().filter { $0.bundleID.hasPrefix(targetPrefix) }.map { $0.obj } }
         let problems = recorder.start(dir: dir, processObjects: objs)
+        sessionProblems = problems
         for p in problems { log("PROBLEM: \(p)") }
         if problems.count >= 2 { alert("Recording failed", problems.joined(separator: "\n")); recorder.stop(); state = .declined; return }
         if !problems.isEmpty { notify("CallScribe: partial recording", problems.joined(separator: "; "), path: nil) }
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime]; iso.timeZone = .current
-        let meta: [String: Any] = ["start": iso.string(from: sessionStart).replacingOccurrences(of: "Z", with: ""), "with": who, "project": project, "problems": problems]
-        if let d = try? JSONSerialization.data(withJSONObject: meta) { try? d.write(to: dir.appendingPathComponent("meta.json")) }
+        writeMeta(dir: dir, problems: problems, events: recorder.events)
         log("recording to \(dir.path)")
         state = .recording
     }
@@ -456,10 +656,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func stopRecording() {
         guard state == .recording, let dir = sessionDir else { return }
         log("stopping recording (\(Int(Date().timeIntervalSince(sessionStart))) s)")
-        recorder.stop()
+        let issues = recorder.stop()
+        for i in issues { log("PROBLEM: \(i)") }
+        writeMeta(dir: dir, problems: sessionProblems + issues, events: recorder.events)
         state = .idle   // WhatsApp input may still be active if stopped by menu; avoid instant re-prompt
         runPipeline(dir: dir, with: sessionWith, project: sessionProject)
         if audioProcesses().contains(where: { $0.bundleID.hasPrefix(targetPrefix) && (detectOutput ? $0.output : $0.input) }) { state = .declined }
+    }
+
+    /// meta.json: who, project, start, problems (plain words, shown in the note) and the recorder's event log.
+    func writeMeta(dir: URL, problems: [String], events: [String]) {
+        let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime]; iso.timeZone = .current
+        let meta: [String: Any] = ["start": iso.string(from: sessionStart).replacingOccurrences(of: "Z", with: ""), "with": sessionWith,
+                                   "project": sessionProject, "problems": problems, "events": events]
+        if let d = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]) { try? d.write(to: dir.appendingPathComponent("meta.json")) }
     }
 
     func runPipeline(dir: URL, with who: String, project: String) {
@@ -520,7 +730,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 }
 
 extension AppDelegate: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) { loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === outputMenu { fillOutputMenu(); return }
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    /// "Other side audio": Automatic (where WhatsApp plays, else the default output) or one fixed output device.
+    func fillOutputMenu() {
+        outputMenu.removeAllItems()
+        let current = preferredOutputUID
+        let auto = NSMenuItem(title: "Automatic (recommended)", action: #selector(pickOutput(_:)), keyEquivalent: "")
+        auto.target = self; auto.representedObject = nil; auto.state = current == nil ? .on : .off
+        outputMenu.addItem(auto); outputMenu.addItem(.separator())
+        let def = defaultOutput()?.uid
+        for d in outputDevices() {
+            let i = NSMenuItem(title: d.name + (d.uid == def ? "  (default output)" : ""), action: #selector(pickOutput(_:)), keyEquivalent: "")
+            i.target = self; i.representedObject = d.uid; i.state = d.uid == current ? .on : .off
+            outputMenu.addItem(i)
+        }
+        if state == .recording, !recorder.device.isEmpty {
+            outputMenu.addItem(.separator())
+            let now = NSMenuItem(title: "Recording from: \(recorder.device)", action: nil, keyEquivalent: ""); now.isEnabled = false
+            outputMenu.addItem(now)
+        }
+    }
+
+    @objc func pickOutput(_ sender: NSMenuItem) {
+        preferredOutputUID = sender.representedObject as? String
+        log("other side audio set to \(preferredOutputUID ?? "Automatic")")
+        if state == .recording { recorder.restartTap(force: true); updateIcon() }
+    }
 }
 
 // MARK: - Update check (app-standard UPDATES.md): asks GitHub Releases of the repo, sends nothing else
@@ -632,6 +871,15 @@ func cliMain(_ a: [String]) -> Bool {
         }
         s.wait(); return true
     }
+    if a.count >= 2, a[1] == "--devices" {   // output devices the "Other side audio" menu offers
+        let def = defaultOutput()?.uid
+        for d in outputDevices() {
+            var rate = Float64(0); var sz = UInt32(MemoryLayout<Float64>.size); var ra = addr(kAudioDevicePropertyNominalSampleRate)
+            _ = AudioObjectGetPropertyData(d.id, &ra, 0, nil, &sz, &rate)
+            print("\(d.uid == def ? "*" : " ") \(d.name) | \(Int(rate)) Hz | uid=\(d.uid)")
+        }
+        print("menu choice: \(preferredOutputUID ?? "Automatic")"); return true
+    }
     if a.count >= 2, a[1] == "--list" {
         for p in audioProcesses() { print("obj=\(p.obj) pid=\(p.pid) bundle='\(p.bundleID)' input=\(p.input) output=\(p.output)") }
         return true
@@ -645,10 +893,20 @@ func cliMain(_ a: [String]) -> Bool {
         else { objs = audioProcesses().filter { $0.bundleID.hasPrefix(target) }.map { $0.obj } }
         print("target objects: \(objs)")
         let r = Recorder()
+        r.rescan = { objs }
         let problems = r.start(dir: dir, processObjects: objs)
         print("problems: \(problems)")
-        RunLoop.current.run(until: Date().addingTimeInterval(secs))
-        r.stop(); print("tap frames: \(r.themFrames)")
+        // CALLSCRIBE_TEST_RESTART=<s>: rebuild tap and mic once at second s, to prove the timeline survives a restart
+        let restartAt = Double(ProcessInfo.processInfo.environment["CALLSCRIBE_TEST_RESTART"] ?? "") ?? -1
+        let t0 = Date(); var restarted = false
+        while Date().timeIntervalSince(t0) < secs {
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+            if restartAt >= 0, !restarted, Date().timeIntervalSince(t0) >= restartAt { restarted = true; r.restartTap(force: true); r.restartMic(force: true) }
+            r.health(otherSideActive: true)
+        }
+        print("device: \(r.device)"); print("frames before stop: mic \(r.micFrames), them \(r.themFrames)")
+        let issues = r.stop()
+        print("events: \(r.events)"); print("issues: \(issues)")
         return true
     }
     return false
