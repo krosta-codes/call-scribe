@@ -526,7 +526,7 @@ enum State { case idle, prompting, recording, declined }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    var state = State.idle { didSet { updateIcon() } }
+    var state = State.idle { didSet { updateIcon(); syncTimer() } }
     var inactiveSince: Date?
     var prompt: PromptController?
     let recorder = Recorder()
@@ -566,9 +566,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             log("stop requested via --stop"); self?.stopFromMenu() }
         let axOK = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         log("accessibility (caller name) trusted: \(axOK)")
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        // Battery: the 1 s tick runs only while a target app runs or a call is in progress (state != .idle).
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in self?.syncTimer() }
+        ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            let gone = (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+            self?.syncTimer(excluding: gone) }
+        syncTimer()
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.checkForUpdates(manual: false) }
         updateTimer = Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { [weak self] _ in self?.checkForUpdates(manual: false) }
+        updateTimer?.tolerance = 3600
+    }
+
+    func targetRunning(excluding pid: pid_t? = nil) -> Bool {
+        // Regular apps only: WhatsApp's ServiceExtension (net.whatsapp.WhatsApp.ServiceExtension) runs all the time, calls need the main app.
+        NSWorkspace.shared.runningApplications.contains { $0.activationPolicy == .regular && ($0.bundleIdentifier ?? "").hasPrefix(targetPrefix) && $0.processIdentifier != pid }
+    }
+
+    /// Start the tick while a target app runs or state != .idle; stop only when idle and no target app runs.
+    func syncTimer(excluding pid: pid_t? = nil) {
+        let need = state != .idle || targetRunning(excluding: pid)
+        if need, timer == nil {
+            let t = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+            t.tolerance = 0.3; timer = t
+        } else if !need, let t = timer { t.invalidate(); timer = nil; lastSignal = "" }
     }
 
     func updateIcon() {

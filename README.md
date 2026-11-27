@@ -2,6 +2,8 @@
 
 # CallScribe
 
+Class: personal · Mac · AI: yes · rung 2
+
 **Records your WhatsApp calls on the Mac (after asking), transcribes them locally, and writes the meeting notes you were never going to write.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-black)](LICENSE) ![Platform](https://img.shields.io/badge/macOS-14.2%2B%20%C2%B7%20Apple%20Silicon-black) [![Release](https://img.shields.io/github/v/release/krosta-codes/call-scribe)](https://github.com/krosta-codes/call-scribe/releases)
